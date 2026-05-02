@@ -157,6 +157,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Generated research reports
+outputs/
+
 # Spyder project settings
 .spyderproject
 .spyproject

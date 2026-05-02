@@ -1,0 +1,57 @@
+[project]
+name = "ai-company-insights"
+version = "0.1.0"
+description = "Evidence-grounded Czech company research agent built with Microsoft Agent Framework."
+readme = "README.md"
+authors = [
+    { name = "Tomas Kubica", email = "tkubica12@gmail.com" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "agent-framework-core>=1.2.2",
+    "agent-framework-foundry>=1.2.2",
+    "azure-ai-projects>=2.1.0",
+    "azure-identity>=1.25.3",
+    "beautifulsoup4>=4.14.3",
+    "crawl4ai>=0.8.6",
+    "httpx>=0.28.1",
+    "markitdown[pdf]>=0.1.5",
+    "pydantic>=2.13.3",
+    "pydantic-settings>=2.14.0",
+    "python-dotenv>=1.2.2",
+    "rich>=15.0.0",
+    "trafilatura>=2.0.0",
+    "typer>=0.25.0",
+]
+
+[project.scripts]
+ai-company-insights = "ai_company_insights.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "respx>=0.23.1",
+    "ruff>=0.15.12",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+include = ["src", "tests"]
