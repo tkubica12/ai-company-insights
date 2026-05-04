@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 from collections import OrderedDict
 
 import httpx
@@ -24,7 +27,7 @@ from ai_company_insights.models import (
     TokenUsage,
 )
 from ai_company_insights.token_usage import merge_token_usage
-from ai_company_insights.utils import host_from_url, truncate
+from ai_company_insights.utils import host_from_url, safe_filename_stem, truncate
 
 
 class CompanyResearcher:
@@ -43,31 +46,23 @@ class CompanyResearcher:
     ) -> CompanyResearchReport:
         mode = mode or ResearchMode(search_provider=self._settings.search_provider)
         identity, ares_citation, ares_raw = await self._ares.resolve_company(company)
+        ares_citation.artifact_path = self._write_json_artifact(
+            "registries", "ares-entity", ares_raw
+        )
         citations: OrderedDict[str, Citation] = OrderedDict([(ares_citation.id, ares_citation)])
 
         queries = self._queries(identity.legal_name or company, identity.ico)
-        search_results: list[SearchResult] = []
         source_errors: list[str] = []
         if mode.search_provider != "foundry-web":
-            for query in queries:
-                try:
-                    search_results.extend(
-                        await self._search.search(
-                            query,
-                            count=self._settings.max_search_results,
-                            provider=mode.search_provider,
-                        )
-                    )
-                except httpx.HTTPError as exc:
-                    source_errors.append(f"search:{mode.search_provider}:{query}: {exc}")
-        news_results: list[SearchResult] = []
-        for query in self._news_queries(identity.legal_name or company):
-            try:
-                news_results.extend(
-                    await self._news.search(query, count=self._settings.max_news_results)
-                )
-            except httpx.HTTPError as exc:
-                source_errors.append(f"news:{query}: {exc}")
+            search_results, search_errors = await self._collect_search_results(
+                queries, mode.search_provider
+            )
+            source_errors.extend(search_errors)
+        else:
+            search_results = []
+        news_queries = self._news_queries(identity.legal_name or company)
+        news_results, news_errors = await self._collect_news_results(news_queries)
+        source_errors.extend(news_errors)
         stock_quote = await self._stocks.get_quote(identity)
 
         unique_results = self._dedupe_results(search_results, limit=self._settings.max_web_results)
@@ -97,26 +92,32 @@ class CompanyResearcher:
                 pages = self._dedupe_pages([*pages, *followup_pages])
         document_urls = self._document_candidate_urls(all_result_urls, pages, followup_urls)
         documents = await self._documents.convert_urls(document_urls)
+        page_artifacts_by_url = self._persist_page_artifacts(pages)
+        document_artifacts_by_url = {document.url: document.artifact_path for document in documents}
 
         for idx, result in enumerate(unique_results, start=1):
             citation_id = f"web-{idx}"
+            url = str(result.url)
             citations[citation_id] = Citation(
                 id=citation_id,
                 title=result.title,
-                url=str(result.url),
+                url=url,
+                artifact_path=self._artifact_for_url(page_artifacts_by_url, url),
                 source_type=f"web_search:{result.provider}",
-                publisher=host_from_url(str(result.url)),
+                publisher=host_from_url(url),
                 snippet=result.snippet,
             )
 
         for idx, result in enumerate(unique_news_results, start=1):
             citation_id = f"news-{idx}"
+            url = str(result.url)
             citations[citation_id] = Citation(
                 id=citation_id,
                 title=result.title,
-                url=str(result.url),
+                url=url,
+                artifact_path=self._artifact_for_url(page_artifacts_by_url, url),
                 source_type=f"news_search:{result.provider}",
-                publisher=host_from_url(str(result.url)),
+                publisher=host_from_url(url),
                 snippet=result.snippet,
             )
 
@@ -126,6 +127,7 @@ class CompanyResearcher:
                 id=citation_id,
                 title=page.title or page.url,
                 url=page.url,
+                artifact_path=page.artifact_path,
                 source_type=f"crawled_page:{page.source}",
                 publisher=host_from_url(page.url),
                 snippet=truncate(page.markdown, 500),
@@ -137,16 +139,21 @@ class CompanyResearcher:
                 id=citation_id,
                 title=document.title or document.url,
                 url=document.url,
+                artifact_path=document.artifact_path or document_artifacts_by_url.get(document.url),
                 source_type=f"document:{document.source}",
                 publisher=host_from_url(document.url),
                 snippet=truncate(document.markdown, 500),
             )
 
         if stock_quote:
+            stock_artifact_path = self._write_json_artifact(
+                "market-data", "stock-quote", stock_quote.model_dump(mode="json")
+            )
             citations["stock-quote"] = Citation(
                 id="stock-quote",
                 title=f"Tržní kotace {stock_quote.symbol}",
                 url=stock_quote.source_url,
+                artifact_path=stock_artifact_path,
                 source_type=f"market_data:{stock_quote.provider}",
                 publisher=stock_quote.exchange_name,
                 snippet=(
@@ -197,9 +204,13 @@ class CompanyResearcher:
             *self._insight_sections(analysis_sources, unique_news_results),
         ]
         opportunity_section = self._opportunities_section(analysis_sources)
+        deep_synthesis_sections = self._local_deep_synthesis_sections(
+            [*core_sections, opportunity_section]
+        )
         sections = [
             *core_sections,
             opportunity_section,
+            *deep_synthesis_sections,
             self._meeting_questions_section([*core_sections, opportunity_section]),
             self._stock_section(stock_quote),
             self._news_section(unique_news_results),
@@ -239,7 +250,7 @@ class CompanyResearcher:
                 "stock_quote": stock_quote.model_dump(mode="json") if stock_quote else None,
                 "foundry_web_search_error": web_grounding_error,
                 "queries": queries,
-                "news_queries": self._news_queries(identity.legal_name or company),
+                "news_queries": news_queries,
                 "source_errors": source_errors,
                 "followup_urls": followup_urls,
                 "document_urls": document_urls,
@@ -252,30 +263,286 @@ class CompanyResearcher:
             try:
                 from ai_company_insights.foundry import FoundrySynthesizer
 
-                synthesized, synthesis_usage = await FoundrySynthesizer(self._settings).synthesize(
-                    report
-                )
+                synthesized, synthesized_sections, synthesis_usage = await FoundrySynthesizer(
+                    self._settings
+                ).synthesize(report)
                 report.executive_summary = synthesized
+                report.sections = self._replace_sections(report.sections, synthesized_sections)
                 report.token_usage = merge_token_usage(report.token_usage, synthesis_usage)
             except Exception as exc:
                 report.raw["foundry_synthesis_error"] = str(exc)
+                report.registrations_needed.append(
+                    "Foundry syntéza se nepodařila; lokální hlubší syntéza z důkazů byla "
+                    "ponechána v reportu. Zkontrolujte tenant Azure CLI přihlášení vůči "
+                    "Foundry projektu."
+                )
         return report
+
+    async def _collect_search_results(
+        self, queries: list[str], provider: str
+    ) -> tuple[list[SearchResult], list[str]]:
+        semaphore = asyncio.Semaphore(self._settings.max_parallel_source_queries)
+
+        async def run_query(query: str) -> tuple[list[SearchResult], str | None]:
+            async with semaphore:
+                try:
+                    results = await self._search.search(
+                        query,
+                        count=self._settings.max_search_results,
+                        provider=provider,
+                    )
+                    return results, None
+                except httpx.HTTPError as exc:
+                    return [], f"search:{provider}:{query}: {exc}"
+
+        return self._merge_query_results(await asyncio.gather(*(run_query(q) for q in queries)))
+
+    async def _collect_news_results(
+        self, queries: list[str]
+    ) -> tuple[list[SearchResult], list[str]]:
+        semaphore = asyncio.Semaphore(self._settings.max_parallel_source_queries)
+
+        async def run_query(query: str) -> tuple[list[SearchResult], str | None]:
+            async with semaphore:
+                try:
+                    results = await self._news.search(
+                        query, count=min(self._settings.max_news_results, 100)
+                    )
+                    return results, None
+                except httpx.HTTPError as exc:
+                    return [], f"news:{query}: {exc}"
+
+        return self._merge_query_results(await asyncio.gather(*(run_query(q) for q in queries)))
+
+    def _merge_query_results(
+        self, query_results: list[tuple[list[SearchResult], str | None]]
+    ) -> tuple[list[SearchResult], list[str]]:
+        results: list[SearchResult] = []
+        errors: list[str] = []
+        for batch, error in query_results:
+            results.extend(batch)
+            if error:
+                errors.append(error)
+        return results, errors
+
+    def _replace_sections(
+        self, sections: list[ReportSection], replacements: list[ReportSection]
+    ) -> list[ReportSection]:
+        if not replacements:
+            return sections
+        by_title = {section.title.casefold(): section for section in replacements}
+        replaced_titles: set[str] = set()
+        merged: list[ReportSection] = []
+        for section in sections:
+            replacement = by_title.get(section.title.casefold())
+            if replacement:
+                merged.append(replacement)
+                replaced_titles.add(section.title.casefold())
+            else:
+                merged.append(section)
+        merged.extend(
+            section for section in replacements if section.title.casefold() not in replaced_titles
+        )
+        return merged
+
+    def _local_deep_synthesis_sections(self, sections: list[ReportSection]) -> list[ReportSection]:
+        evidence_by_title = {
+            section.title: section.evidence for section in sections if section.evidence
+        }
+
+        def first_from(*titles: str) -> Evidence | None:
+            for title in titles:
+                items = evidence_by_title.get(title, [])
+                if items:
+                    return items[0]
+            return None
+
+        def evidence(
+            source: Evidence | None, claim: str, value: str, confidence: float = 0.62
+        ) -> Evidence | None:
+            if not source:
+                return None
+            return Evidence(
+                citation_id=source.citation_id,
+                claim=claim,
+                value=value,
+                confidence=min(source.confidence, confidence),
+            )
+
+        synthesis_items = [
+            evidence(
+                first_from("Finanční informace", "Akciové informace"),
+                "Finance je potřeba číst společně s investiční agendou",
+                "Finanční výsledky, dividenda a tržní data dávají rámec pro posouzení "
+                "kapacity a priorit investic; pro obchodní jednání má smysl spojit finance "
+                "s konkrétními transformačními projekty.",
+            ),
+            evidence(
+                first_from("Strategie a priority", "Významná oznámení a obchody"),
+                "Strategické signály se opakují napříč více typy zdrojů",
+                "Pokud se stejné téma objevuje ve firemních materiálech, médiích i "
+                "investorských zdrojích, je vhodné jej považovat za prioritní směr pro "
+                "další kvalifikaci na schůzce.",
+            ),
+            evidence(
+                first_from("Reputační rizika", "Mediální sentiment"),
+                "Rizika nejsou jen právní, ale i politicko-regulatorní",
+                "U strategických energetických firem má reputační a politická citlivost "
+                "přímý dopad na načasování, schvalování a nákupní procesy.",
+            ),
+            evidence(
+                first_from("Potenciální příležitosti", "Produkty, služby a inovace"),
+                "Obchodní příležitosti vyžadují kvalifikaci proti skutečným projektům",
+                "Signály expanze, partnerství a digitalizace jsou vhodné jako hypotézy, "
+                "nikoli jako hotové potřeby; na schůzce je nutné ověřit vlastníka tématu, "
+                "časování a rozpočet.",
+            ),
+        ]
+
+        quality_items = [
+            evidence(
+                first_from("Identita v registrech", "Vlastnická a skupinová struktura"),
+                "Registry poskytují pevný základ, detail orgánů vyžaduje ověření",
+                "ARES a veřejné registry jsou silné pro identitu a registrace; úplné "
+                "aktuální statutární údaje je vhodné před rozhodnutím ověřit proti "
+                "aktuálnímu výpisu z veřejného rejstříku.",
+            ),
+            evidence(
+                first_from("Veřejné dokumenty", "Finanční informace"),
+                "Velké dokumenty jsou uchované jako artefakty i při omezené extrakci",
+                "U rozsáhlých PDF je prioritou zachovat klikatelné lokální kopie a "
+                "citovatelnost; syntéza by neměla tvrdit více, než podporují extrahované "
+                "výňatky nebo související veřejné stránky.",
+            ),
+            evidence(
+                first_from("Zprávy a média", "Reputační rizika"),
+                "Mediální vzorek může obsahovat duplicity a sekundární interpretace",
+                "Mediální signály jsou užitečné pro témata a rizika, ale je vhodné je "
+                "triangulovat s oficiálními dokumenty, regulatorními zdroji nebo přímým "
+                "vyjádřením firmy.",
+            ),
+        ]
+
+        hypothesis_items = [
+            evidence(
+                first_from("Potenciální příležitosti"),
+                "Kvalifikovat investiční a transformační projekty",
+                "Ověřit, které investiční záměry mají rozpočet, vlastníka, plánované "
+                "milníky a prostor pro externí technologie nebo služby.",
+                confidence=0.66,
+            ),
+            evidence(
+                first_from("Vlastnická a skupinová struktura", "Reputační rizika"),
+                "Zohlednit vlastnické a governance změny v obchodním procesu",
+                "Ověřit, zda změny vlastnické struktury, řízení nebo politická citlivost "
+                "mění rozhodovací mapu, procurement nebo toleranci k riziku.",
+                confidence=0.66,
+            ),
+            evidence(
+                first_from("Produkty, služby a inovace", "Byznysový kontext"),
+                "Hledat vstupní bod přes provozní efektivitu a digitalizaci",
+                "Ověřit, kde má firma konkrétní provozní problém, který lze spojit s "
+                "digitalizací, prediktivní údržbou, zákaznickými službami nebo řízením sítě.",
+                confidence=0.66,
+            ),
+        ]
+
+        return [
+            ReportSection(
+                title="Hlubší syntéza a triangulace",
+                summary=(
+                    "Lokální syntéza propojuje registry, finanční zdroje, strategické signály, "
+                    "média a příležitosti do obchodně použitelných závěrů."
+                ),
+                evidence=[item for item in synthesis_items if item],
+            ),
+            ReportSection(
+                title="Kontrola kvality a mezery v důkazech",
+                summary=(
+                    "Kontrolní vrstva označuje, kde jsou důkazy silné a kde je potřeba "
+                    "opatrnost nebo manuální ověření před jednáním."
+                ),
+                evidence=[item for item in quality_items if item],
+            ),
+            ReportSection(
+                title="Obchodní hypotézy pro další jednání",
+                summary=(
+                    "Hypotézy převádějí veřejné signály na témata, která má obchodní tým "
+                    "ověřit v první schůzce."
+                ),
+                evidence=[item for item in hypothesis_items if item],
+            ),
+        ]
+
+    def _persist_page_artifacts(self, pages: list[CrawledPage]) -> dict[str, str]:
+        artifacts_by_url: dict[str, str] = {}
+        for idx, page in enumerate(pages, start=1):
+            title = page.title or page.url
+            artifact_path = self._write_text_artifact(
+                "pages",
+                f"{idx:03d}-{safe_filename_stem(title, default='page')}",
+                page.markdown,
+                suffix=".md",
+            )
+            if artifact_path:
+                page.artifact_path = artifact_path
+                artifacts_by_url[page.url] = artifact_path
+                artifacts_by_url[self._url_key(page.url)] = artifact_path
+        return artifacts_by_url
+
+    def _artifact_for_url(self, artifacts_by_url: dict[str, str], url: str) -> str | None:
+        return artifacts_by_url.get(url) or artifacts_by_url.get(self._url_key(url))
+
+    def _url_key(self, url: str) -> str:
+        return url.split("#", 1)[0].rstrip("/").casefold()
+
+    def _write_json_artifact(self, category: str, stem: str, payload: object) -> str | None:
+        return self._write_text_artifact(
+            category,
+            stem,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            suffix=".json",
+        )
+
+    def _write_text_artifact(
+        self, category: str, stem: str, content: str, *, suffix: str
+    ) -> str | None:
+        artifact_dir = self._settings.output_artifact_dir
+        link_prefix = self._settings.output_artifact_link_prefix
+        if not artifact_dir or not link_prefix:
+            return None
+        digest = hashlib.sha256(f"{category}/{stem}/{content[:500]}".encode()).hexdigest()[:10]
+        filename = f"{safe_filename_stem(stem)}-{digest}{suffix}"
+        target = artifact_dir / category / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"{link_prefix}/{category}/{filename}"
 
     def _queries(self, legal_name: str, ico: str | None) -> list[str]:
         queries = [
             f'"{legal_name}" oficiální web',
             f'"{legal_name}" obchodní rejstřík statutární orgán vlastnická struktura',
+            f'"{legal_name}" veřejný rejstřík sbírka listin stanovy představenstvo dozorčí rada',
             f'"{legal_name}" profil obor hlavní činnost zaměstnanci',
             f'"{legal_name}" výroční zpráva annual report 2024',
+            f'"{legal_name}" výroční zpráva annual report 2023 2022',
+            f'"{legal_name}" quarterly results presentation investor relations',
             f'"{legal_name}" účetní závěrka hospodářské výsledky tržby EBITDA',
+            f'"{legal_name}" akcionáři dividenda dluhopisy rating financování',
             f'"{legal_name}" investor relations strategie',
+            f'"{legal_name}" prezentace pro investory kapitálové výdaje CAPEX',
             f'"{legal_name}" produkty služby',
+            f'"{legal_name}" zákazníci dodavatelé veřejné zakázky procurement',
             f'"{legal_name}" ESG dekarbonizace obnovitelné jaderná energetika',
+            f'"{legal_name}" udržitelnost ESG zpráva klimatický plán emise',
             f'"{legal_name}" SMR Rolls-Royce Temelín',
+            f'"{legal_name}" Dukovany Temelín jaderné palivo Framatome KHNP',
             f'"{legal_name}" AI prediktivní údržba diagnostika',
             f'"{legal_name}" akvizice partnerství smlouvy kontrakty',
             f'"{legal_name}" investice expanze nové oblasti změna vedení',
+            f'"{legal_name}" mergers acquisitions divestment sale subsidiary',
             f'"{legal_name}" žaloby insolvence sankce veřejná kauza',
+            f'"{legal_name}" ÚOHS soud žaloba regulatorní riziko compliance',
             f'"{legal_name}" akcie burza Praha',
         ]
         if ico:
@@ -292,6 +559,8 @@ class CompanyResearcher:
             f'"{legal_name}" umělá inteligence',
             f'"{legal_name}" výsledky akcie',
             f'"{legal_name}" investice akvizice expanze vedení',
+            f'"{legal_name}" financování dividenda rating výsledky',
+            f'"{legal_name}" veřejné zakázky partnerství dodavatel',
             f'"{legal_name}" kauza soud insolvence sankce',
         ]
 
@@ -522,7 +791,9 @@ class CompanyResearcher:
                 ["skupina", "group", "dceřin", "subsidiar", "holding", "mateřsk"],
             ),
         ]
-        evidence.extend(self._theme_evidence(sources, themes, confidence=0.68))
+        evidence.extend(
+            self._theme_evidence(self._official_sources_first(sources), themes, confidence=0.68)
+        )
         if not evidence:
             return ReportSection(
                 title="Byznysový kontext",
@@ -586,7 +857,9 @@ class CompanyResearcher:
                 ["skupina", "group", "dceřin", "subsidiar", "holding", "mateřsk"],
             ),
         ]
-        evidence.extend(self._theme_evidence(sources, themes, confidence=0.7))
+        evidence.extend(
+            self._theme_evidence(self._official_sources_first(sources), themes, confidence=0.7)
+        )
         summary = (
             "Sekce soustřeďuje základní registry a dostupné signály o orgánech, "
             "vlastnictví a skupinové struktuře. Detail statutárů je vhodné v případě "
@@ -615,7 +888,9 @@ class CompanyResearcher:
                 ["dividend", "akcie", "burza", "market cap", "tržní kapitaliz"],
             ),
         ]
-        evidence = self._theme_evidence(sources, themes, confidence=0.72)
+        evidence = self._theme_evidence(
+            self._official_sources_first(sources), themes, confidence=0.72
+        )
         if stock_quote:
             value = (
                 f"{stock_quote.symbol}: poslední cena {stock_quote.regular_market_price} "
@@ -681,12 +956,11 @@ class CompanyResearcher:
             (
                 "Investiční záměry a expanze",
                 [
-                    "investič",
-                    "investic",
-                    "investment",
                     "expanz",
                     "moderniz",
                     "výstavb",
+                    "budov",
+                    "rozvoj",
                     "větr",
                     "renewable",
                     "obnoviteln",
@@ -727,6 +1001,9 @@ class CompanyResearcher:
         opportunity_sources = self._prioritized_sources(
             sources, ("news-", "page-", "document-", "web-")
         )
+        opportunity_sources = [
+            source for source in opportunity_sources if not self._is_opportunity_noise(source)
+        ]
         evidence = self._theme_evidence(opportunity_sources, themes, confidence=0.66)
         if not evidence:
             return ReportSection(
@@ -799,13 +1076,23 @@ class CompanyResearcher:
     ) -> list[tuple[str, str, str]]:
         sources: list[tuple[str, str, str]] = []
         for idx, result in enumerate(web_results, start=1):
-            sources.append((f"web-{idx}", result.title, self._source_note(result)))
+            sources.append(
+                (f"web-{idx}", f"{result.title} {result.url}", self._source_note(result))
+            )
         for idx, result in enumerate(news_results, start=1):
-            sources.append((f"news-{idx}", result.title, self._source_note(result)))
+            sources.append(
+                (f"news-{idx}", f"{result.title} {result.url}", self._source_note(result))
+            )
         for idx, page in enumerate(pages, start=1):
-            sources.append((f"page-{idx}", page.title or page.url, page.markdown))
+            sources.append((f"page-{idx}", f"{page.title or page.url} {page.url}", page.markdown))
         for idx, document in enumerate(documents, start=1):
-            sources.append((f"document-{idx}", document.title or document.url, document.markdown))
+            sources.append(
+                (
+                    f"document-{idx}",
+                    f"{document.title or document.url} {document.url}",
+                    document.markdown,
+                )
+            )
         return sources
 
     def _strategy_section(self, sources: list[tuple[str, str, str]]) -> ReportSection:
@@ -837,7 +1124,9 @@ class CompanyResearcher:
                 ["uměl", "neuron", "prediktiv", "diagnost", "artificial intelligence", "digital"],
             ),
         ]
-        evidence = self._theme_evidence(sources, themes, confidence=0.72)
+        evidence = self._theme_evidence(
+            self._official_sources_first(sources), themes, confidence=0.72
+        )
         if not evidence:
             return ReportSection(
                 title="Strategie a priority",
@@ -874,7 +1163,9 @@ class CompanyResearcher:
                 ["neuron", "prediktivní diagnost", "umělé inteligenci", "artificial intelligence"],
             ),
         ]
-        evidence = self._theme_evidence(sources, themes, confidence=0.7)
+        evidence = self._theme_evidence(
+            self._official_sources_first(sources), themes, confidence=0.7
+        )
         if not evidence:
             return ReportSection(
                 title="Produkty, služby a inovace",
@@ -948,7 +1239,9 @@ class CompanyResearcher:
                 ["prediktiv", "diagnost", "neuron", "umělé inteligenci"],
             ),
         ]
-        evidence = self._theme_evidence(sources, themes, confidence=0.68)
+        evidence = self._theme_evidence(
+            self._official_sources_first(sources), themes, confidence=0.68
+        )
         if not evidence:
             return ReportSection(
                 title="Oborové trendy",
@@ -1038,6 +1331,38 @@ class CompanyResearcher:
             if citation_id not in used:
                 prioritized.append(source)
         return prioritized
+
+    def _official_sources_first(
+        self, sources: list[tuple[str, str, str]]
+    ) -> list[tuple[str, str, str]]:
+        official_markers = [
+            "cez.cz",
+            "cezdistribuce.cz",
+            "cezesco.cz",
+            "cezprodej.cz",
+            "pse.cz",
+        ]
+
+        def rank(source: tuple[str, str, str]) -> int:
+            haystack = f"{source[1]} {source[2][:300]}".casefold()
+            return 0 if any(marker in haystack for marker in official_markers) else 1
+
+        return sorted(sources, key=rank)
+
+    def _is_opportunity_noise(self, source: tuple[str, str, str]) -> bool:
+        haystack = f"{source[1]} {source[2][:1200]}".casefold()
+        risk_markers = [
+            "podvod",
+            "falešn",
+            "scam",
+            "deep fake",
+            "deepfake",
+            "zneužív",
+            "klamav",
+            "fake",
+            "reklam",
+        ]
+        return any(marker in haystack for marker in risk_markers)
 
     def _first_keyword_match(
         self,

@@ -18,6 +18,7 @@ uv run ai-company-insights research "ČEZ" --output outputs\cez.json --foundry-w
 
 Výstupní JSON obsahuje strukturované sekce, pole `citations` a `token_usage`. Tvrzení odkazují na citační ID.
 CLI ve výchozím stavu zapisuje i čitelný Markdown report vedle JSON výstupu. Cestu lze změnit přes `--markdown-output`, případně Markdown vypnout přes `--no-markdown`.
+Vedle Markdownu vzniká složka `*-files` s lokálně uloženými artefakty: stažené dokumenty, extrahované stránky, registry a tržní data. Citace v reportu odkazují na tyto lokální artefakty, pokud existují; tabulka zdrojů zároveň zachová odkaz na původní web.
 
 ## Foundry Web Search / Grounding with Bing
 
@@ -39,6 +40,7 @@ Nastavte `NEWSAPI_API_KEY` a `MEDIASTACK_API_KEY` pro doplnění novinových a m
 ## Šablona Markdown reportu
 
 Čitelný report se vykresluje ze souboru `templates\company_report.md`, takže názvy a pořadí kapitol lze měnit bez úprav promptů nebo Python kódu. Renderer podporuje zástupné symboly jako `{{company_at_glance}}`, `{{executive_summary}}`, `{{resources_table}}`, `{{token_usage}}` a `{{section:Název sekce}}`.
+Pokud je zapnutá Foundry syntéza, agent provede vícekrokovou syntézu v rolích analytik, skeptický reviewer a finální syntetizátor. Do reportu pak doplní hlubší triangulaci, mezery v důkazech a obchodní hypotézy pro další jednání.
 
 ## Akciové informace
 

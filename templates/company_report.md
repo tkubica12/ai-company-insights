@@ -65,6 +65,18 @@ Vygenerováno: {{generated_at}}
 
 {{section:Potenciální příležitosti}}
 
+### Hlubší syntéza a triangulace
+
+{{section:Hlubší syntéza a triangulace}}
+
+### Kontrola kvality a mezery v důkazech
+
+{{section:Kontrola kvality a mezery v důkazech}}
+
+### Obchodní hypotézy pro další jednání
+
+{{section:Obchodní hypotézy pro další jednání}}
+
 ### Navržené okruhy témat a otázky
 
 {{section:Otázky pro první obchodní schůzku}}

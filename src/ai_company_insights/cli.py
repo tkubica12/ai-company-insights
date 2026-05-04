@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 from typing import Annotated
 
@@ -43,6 +44,20 @@ def research(
     ] = "auto",
 ) -> None:
     settings = get_settings()
+    if output is None:
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(ch if ch.isalnum() else "-" for ch in company).strip("-").lower()
+        output = settings.output_dir / f"{safe_name or 'company'}-research.json"
+    markdown_output = markdown_output or output.with_suffix(".md")
+    artifact_dir = markdown_output.with_name(f"{markdown_output.stem}-files")
+    if artifact_dir.exists():
+        shutil.rmtree(artifact_dir)
+    settings = settings.model_copy(
+        update={
+            "output_artifact_dir": artifact_dir,
+            "output_artifact_link_prefix": artifact_dir.name,
+        }
+    )
     mode = ResearchMode(
         use_foundry_synthesis=foundry_synthesis,
         use_foundry_web_search=foundry_web_search,
@@ -51,16 +66,11 @@ def research(
     report = asyncio.run(CompanyResearcher(settings).research(company, mode=mode))
     text = report.model_dump_json(indent=2)
 
-    if output is None:
-        settings.output_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = "".join(ch if ch.isalnum() else "-" for ch in company).strip("-").lower()
-        output = settings.output_dir / f"{safe_name or 'company'}-research.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text, encoding="utf-8")
 
     console.print(f"[green]Zapsán strukturovaný report s citacemi:[/green] {output}")
     if markdown:
-        markdown_output = markdown_output or output.with_suffix(".md")
         markdown_output.parent.mkdir(parents=True, exist_ok=True)
         markdown_output.write_text(
             MarkdownReportRenderer(settings).render(report), encoding="utf-8"

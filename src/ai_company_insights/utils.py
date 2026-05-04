@@ -30,3 +30,10 @@ def truncate(value: str, max_chars: int) -> str:
 
 def first_non_empty(values: Iterable[str | None]) -> str | None:
     return next((value for value in values if value), None)
+
+
+def safe_filename_stem(value: str, *, default: str = "source", max_length: int = 80) -> str:
+    text = unicodedata.normalize("NFKD", value)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip(".-_")
+    return (text[:max_length].strip(".-_") or default).lower()

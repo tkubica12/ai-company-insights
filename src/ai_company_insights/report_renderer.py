@@ -63,10 +63,11 @@ class MarkdownReportRenderer:
         if not section:
             return ""
         if section.title.casefold() in {"extrahovaný obsah zdrojů", "veřejné dokumenty"}:
-            return self._render_evidence_blocks(section)
+            return self._render_evidence_blocks(section, report.citations)
         lines = [section.summary]
         if section.evidence:
             finding_header, evidence_header = self._headers_for_section(section.title)
+            citations_by_id = {citation.id: citation for citation in report.citations}
             lines.extend(
                 [
                     "",
@@ -75,10 +76,11 @@ class MarkdownReportRenderer:
                 ]
             )
             for evidence in section.evidence:
-                lines.append(self._evidence_row(evidence))
+                lines.append(self._evidence_row(evidence, citations_by_id))
         return "\n".join(lines)
 
-    def _render_evidence_blocks(self, section: ReportSection) -> str:
+    def _render_evidence_blocks(self, section: ReportSection, citations: list[Citation]) -> str:
+        citations_by_id = {citation.id: citation for citation in citations}
         lines = [section.summary]
         for evidence in section.evidence:
             lines.extend(
@@ -86,7 +88,9 @@ class MarkdownReportRenderer:
                     "",
                     f"### {evidence.claim}",
                     "",
-                    f"Citace: [{evidence.citation_id}] · Spolehlivost: {evidence.confidence:.2f}",
+                    "Citace: "
+                    f"{self._citation_link(evidence.citation_id, citations_by_id)} · "
+                    f"Spolehlivost: {evidence.confidence:.2f}",
                     "",
                     self._blockquote(evidence.value or ""),
                 ]
@@ -120,6 +124,12 @@ class MarkdownReportRenderer:
             return ("Příležitost", "Proč je relevantní")
         if section_title == "otázky pro první obchodní schůzku":
             return ("Otázka", "Důvod")
+        if section_title == "hlubší syntéza a triangulace":
+            return ("Syntetizované zjištění", "Interpretace")
+        if section_title == "kontrola kvality a mezery v důkazech":
+            return ("Kontrolní bod", "Dopad na spolehlivost")
+        if section_title == "obchodní hypotézy pro další jednání":
+            return ("Hypotéza", "Jak ji ověřit")
         if section_title == "akciové informace":
             return ("Metrika", "Hodnota")
         if section_title == "identita v registrech":
@@ -128,10 +138,11 @@ class MarkdownReportRenderer:
             return ("Dokument", "Výňatek")
         return ("Zjištění", "Důkaz")
 
-    def _evidence_row(self, evidence: Evidence) -> str:
+    def _evidence_row(self, evidence: Evidence, citations_by_id: dict[str, Citation]) -> str:
         return (
             f"| {self._cell(evidence.claim)} | {self._cell(evidence.value or '')} | "
-            f"[{self._cell(evidence.citation_id)}] | {evidence.confidence:.2f} |"
+            f"{self._citation_link(evidence.citation_id, citations_by_id)} | "
+            f"{evidence.confidence:.2f} |"
         )
 
     def _resources_table(self, citations: list[Citation]) -> str:
@@ -140,7 +151,7 @@ class MarkdownReportRenderer:
                 citation.id,
                 citation.source_type,
                 citation.publisher or "",
-                f"[{citation.title}]({citation.url})" if citation.url else citation.title,
+                self._resource_link(citation),
             )
             for citation in citations
         ]
@@ -178,3 +189,26 @@ class MarkdownReportRenderer:
     def _blockquote(self, value: str) -> str:
         lines = str(value).strip().splitlines()
         return "\n".join(f"> {line}" if line else ">" for line in lines)
+
+    def _citation_link(self, citation_id: str, citations_by_id: dict[str, Citation]) -> str:
+        citation = citations_by_id.get(citation_id)
+        if not citation:
+            return f"[{self._cell(citation_id)}]"
+        target = citation.artifact_path or citation.url
+        if not target:
+            return f"[{self._cell(citation_id)}]"
+        return f"[{self._cell(citation_id)}]({self._markdown_url(target)})"
+
+    def _resource_link(self, citation: Citation) -> str:
+        if citation.artifact_path and citation.url:
+            return (
+                f"[{self._cell(citation.title)}]({self._markdown_url(citation.artifact_path)})"
+                f" · [web]({self._markdown_url(citation.url)})"
+            )
+        target = citation.artifact_path or citation.url
+        if target:
+            return f"[{self._cell(citation.title)}]({self._markdown_url(target)})"
+        return citation.title
+
+    def _markdown_url(self, value: str) -> str:
+        return str(value).replace(" ", "%20").replace(")", "%29")

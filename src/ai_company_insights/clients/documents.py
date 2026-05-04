@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import tempfile
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -9,7 +10,7 @@ import httpx
 
 from ai_company_insights.config import Settings
 from ai_company_insights.models import CrawledPage
-from ai_company_insights.utils import truncate
+from ai_company_insights.utils import safe_filename_stem, truncate
 
 
 class DocumentProcessor:
@@ -39,19 +40,35 @@ class DocumentProcessor:
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
+        artifact_path = self._store_document(str(response.url), response.content, suffix)
+        if len(response.content) > self._settings.max_document_conversion_bytes:
+            return CrawledPage(
+                url=str(response.url),
+                title=self._title_from_url(str(response.url)),
+                markdown=(
+                    "Dokument byl stažen a uložen jako lokální artefakt, ale nebyl celý "
+                    "převeden do Markdownu, protože překročil limit velikosti pro bezpečnou "
+                    "konverzi."
+                ),
+                source="downloaded-document",
+                artifact_path=artifact_path,
+            )
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             temp_file.write(response.content)
             temp_path = Path(temp_file.name)
         try:
             if suffix.casefold() == ".pdf":
-                return self._convert_pdf(url=str(response.url), temp_path=temp_path)
+                page = self._convert_pdf(url=str(response.url), temp_path=temp_path)
+                page.artifact_path = artifact_path
+                return page
             result = MarkItDown().convert(str(temp_path))
             return CrawledPage(
                 url=str(response.url),
                 title=self._title_from_url(str(response.url)),
                 markdown=truncate(result.text_content or "", self._settings.max_page_chars),
                 source="markitdown",
+                artifact_path=artifact_path,
             )
         finally:
             temp_path.unlink(missing_ok=True)
@@ -75,3 +92,17 @@ class DocumentProcessor:
     def _title_from_url(self, url: str) -> str:
         path = unquote(urlparse(url).path)
         return Path(path).name or url
+
+    def _store_document(self, url: str, content: bytes, suffix: str) -> str | None:
+        artifact_dir = self._settings.output_artifact_dir
+        link_prefix = self._settings.output_artifact_link_prefix
+        if not artifact_dir or not link_prefix:
+            return None
+        path = unquote(urlparse(url).path)
+        stem = safe_filename_stem(Path(path).stem or "document", default="document")
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
+        filename = f"{stem}-{digest}{suffix.lower()}"
+        target = artifact_dir / "documents" / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        return f"{link_prefix}/documents/{filename}"

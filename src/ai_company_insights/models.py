@@ -8,6 +8,7 @@ class Citation(BaseModel):
     id: str
     title: str
     url: str | None = None
+    artifact_path: str | None = None
     source_type: str
     publisher: str | None = None
     accessed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -46,6 +47,7 @@ class CrawledPage(BaseModel):
     markdown: str
     source: str
     links: list[str] = Field(default_factory=list)
+    artifact_path: str | None = None
 
 
 class StockQuote(BaseModel):

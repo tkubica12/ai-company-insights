@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import httpx
@@ -49,12 +50,16 @@ class AresClient:
         return identity, citation, raw
 
     async def _get_by_ico(self, client: httpx.AsyncClient, ico: str) -> dict[str, Any]:
-        response = await client.get(f"{self.base_url}/ekonomicke-subjekty/{ico}")
+        response = await self._request_with_retries(
+            client, "GET", f"{self.base_url}/ekonomicke-subjekty/{ico}"
+        )
         response.raise_for_status()
         return response.json()
 
     async def _search_and_select(self, client: httpx.AsyncClient, query: str) -> dict[str, Any]:
-        response = await client.post(
+        response = await self._request_with_retries(
+            client,
+            "POST",
             f"{self.base_url}/ekonomicke-subjekty/vyhledat",
             json={"obchodniJmeno": query},
         )
@@ -82,3 +87,19 @@ class AresClient:
 
         selected = max(subjects, key=score)
         return await self._get_by_ico(client, selected["ico"])
+
+    async def _request_with_retries(
+        self, client: httpx.AsyncClient, method: str, url: str, **kwargs: Any
+    ) -> httpx.Response:
+        last_error: httpx.HTTPError | None = None
+        for attempt in range(3):
+            try:
+                return await client.request(method, url, **kwargs)
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+                last_error = exc
+                if attempt == 2:
+                    break
+                await asyncio.sleep(1.5 * (attempt + 1))
+        if last_error:
+            raise last_error
+        raise RuntimeError("ARES request retry loop exited unexpectedly.")

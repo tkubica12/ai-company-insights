@@ -57,7 +57,7 @@ def test_markdown_report_renderer_uses_template_sections(tmp_path) -> None:
 
     assert "# ČEZ, a. s." in markdown
     assert "ARES dohledal firmu." in markdown
-    assert "| Obchodní firma | ČEZ, a. s. | [ares-entity] |" in markdown
+    assert "| Obchodní firma | ČEZ, a. s. | [ares-entity](https://ares.gov.cz/) |" in markdown
     assert "| Vstupní tokeny | 0 |" in markdown
     assert "[ARES](https://ares.gov.cz/)" in markdown
 
@@ -122,3 +122,43 @@ def test_public_documents_render_as_markdown_blocks(tmp_path) -> None:
     assert "### vyrocni-zprava.pdf" in markdown
     assert "Citace: [document-1]" in markdown
     assert "> ## Strana 1" in markdown
+
+
+def test_citation_links_prefer_local_artifacts(tmp_path) -> None:
+    template = tmp_path / "report.md"
+    template.write_text("{{section:Finanční informace}}\n\n{{resources_table}}\n", encoding="utf-8")
+    report = CompanyResearchReport(
+        company=CompanyIdentity(query="ČEZ", ico="45274649", legal_name="ČEZ, a. s."),
+        generated_at=datetime(2026, 4, 30, tzinfo=UTC),
+        executive_summary="Shrnutí",
+        sections=[
+            ReportSection(
+                title="Finanční informace",
+                summary="Finance.",
+                evidence=[
+                    Evidence(
+                        citation_id="document-1",
+                        claim="Výroční zpráva",
+                        value="Dokument je uložen lokálně.",
+                    )
+                ],
+            )
+        ],
+        citations=[
+            Citation(
+                id="document-1",
+                title="Výroční zpráva",
+                url="https://example.com/report.pdf",
+                artifact_path="cez-files/documents/report.pdf",
+                source_type="document:pdfplumber",
+            )
+        ],
+    )
+
+    markdown = MarkdownReportRenderer(Settings(report_template_path=template)).render(report)
+
+    assert "[document-1](cez-files/documents/report.pdf)" in markdown
+    assert (
+        "[Výroční zpráva](cez-files/documents/report.pdf) · [web](https://example.com/report.pdf)"
+        in markdown
+    )
